@@ -1,32 +1,44 @@
 package main
 
 import (
-    "flag"
     "fmt"
-	"net/http"
+    "net/http"
+    "sync"
 )
 
-func main() {
-    // Déclaration d'un flag "--target" avec une valeur par défaut et une description
-    target := flag.String("target", "http://127.0.0.1", "L'adresse IP cible à scanner")
+// On passe le WaitGroup sous forme de pointeur pour partager le même compteur
+func scannerCible(url string, wg *sync.WaitGroup) {
+    defer wg.Done()
+
+    resp, err := http.Get(url)
+    if err != nil {
+        fmt.Printf("[ERREUR] %s : Erreur de connexion\n", url)
+        return
+    }
+    defer resp.Body.Close()
     
-    // Cette fonction lit les arguments du terminal et les assigne aux variables
-    flag.Parse()
+    fmt.Printf("[SUCCÈS] %s : Statut HTTP %d\n", url, resp.StatusCode)
+}
 
-    // Comment afficherais-tu la valeur de target ici ?
-	fmt.Printf("Lancement du scan sur la cible : %s\n", *target)
+func main() {
+    cibles := []string{
+        "http://127.0.0.1",
+        "https://google.com",
+        "https://github.com",
+        "http://une-url-qui-n-existe-pas.lol",
+    }
 
-	resp, err := http.Get(*target)
+    fmt.Println("Début du scan multi-cibles...")
 
-	if err != nil {
+    var wg sync.WaitGroup
 
-		fmt.Println("Erreur de connexion")
+    for _, cible := range cibles {
+        wg.Add(1)
+        
+        go scannerCible(cible, &wg)
+    }
 
-		return
-
-	}
-
-	defer resp.Body.Close()
-	
-	fmt.Printf("Cible en ligne! Statut HTTP : %d\n", resp.StatusCode)
+    wg.Wait()
+    
+    fmt.Println("Scan terminé !")
 }
