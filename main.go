@@ -1,81 +1,153 @@
 package main
 
 import (
-    "fmt"
-    "net/http"
-    "sync"
-    "encoding/json"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
 )
 
-type RapportScan struct {
-    Cible   string `json:"target_url"`
-    Statut  int    `json:"status_code"`
-    EnLigne bool   `json:"is_online"`
+// Shared HTTP client for all outgoing requests (tuned timeout)
+var httpClient = &http.Client{Timeout: 10 * time.Second}
+
+// ScanReport represents the result of scanning a single target
+type ScanReport struct {
+	Target string `json:"target_url"`
+	Status int    `json:"status_code"`
+	Online bool   `json:"is_online"`
 }
 
-// On passe le WaitGroup sous forme de pointeur pour partager le même compteur
-func scannerCible(url string, wg *sync.WaitGroup, ch chan<- RapportScan) {
-    defer wg.Done()
-
-    resp, err := http.Get(url)
-    if err != nil {
-        fmt.Printf("[ERREUR] %s : Erreur de connexion\n", url)
-        ch <- RapportScan{Cible: url, Statut: 0, EnLigne: false}
-        return
-    }
-    defer resp.Body.Close()
-    
-    fmt.Printf("[SUCCÈS] %s : Statut HTTP %d\n", url, resp.StatusCode)
-    ch <- RapportScan{Cible: url, Statut: resp.StatusCode, EnLigne: resp.StatusCode == http.StatusOK}
+// FuzzReport represents the result of sending a single fuzz payload
+type FuzzReport struct {
+	Payload    string `json:"payload"`
+	Status     int    `json:"status_code"`
+	BodyLength int    `json:"body_length"`
+	Error      string `json:"error,omitempty"`
 }
 
-func handlerScan(w http.ResponseWriter, r *http.Request) {
-    defer r.Body.Close()
+// scanTarget performs an HTTP GET on the provided target and sends a ScanReport
+func scanTarget(target string, wg *sync.WaitGroup, results chan<- ScanReport) {
+	defer wg.Done()
 
-    queryParams := r.URL.Query()
+	resp, err := httpClient.Get(target)
+	if err != nil {
+		log.Printf("error connecting to %s: %v", target, err)
+		results <- ScanReport{Target: target, Status: 0, Online: false}
+		return
+	}
+	defer resp.Body.Close()
 
-    if !queryParams.Has("urls") {
-        http.Error(w, "Url parameter missing", http.StatusBadRequest)
-        return
-    }
+	online := resp.StatusCode < 400
+	log.Printf("scanned %s -> status %d", target, resp.StatusCode)
+	results <- ScanReport{Target: target, Status: resp.StatusCode, Online: online}
+}
 
-    urls := queryParams["urls"]
+// scanHandler handles /api/scan?urls=... and returns a JSON array of ScanReport
+func scanHandler(w http.ResponseWriter, r *http.Request) {
+	// Query parameters are read-only; no body processing required
+	query := r.URL.Query()
+	if !query.Has("urls") {
+		http.Error(w, "urls parameter missing", http.StatusBadRequest)
+		return
+	}
 
-    fmt.Println("Début du scan multi-cibles...")
+	targets := query["urls"]
 
-    var wg sync.WaitGroup
-    resultsCh := make(chan RapportScan, len(urls))
+	log.Println("starting multi-target scan")
 
-    for _, cible := range urls {
-        wg.Add(1)
-        go scannerCible(cible, &wg, resultsCh)
-    }
+	var wg sync.WaitGroup
+	resultsCh := make(chan ScanReport, len(targets))
 
-    // Ferme le channel une fois toutes les goroutines terminées
-    go func() {
-        wg.Wait()
-        close(resultsCh)
-    }()
+	for _, t := range targets {
+		wg.Add(1)
+		go scanTarget(t, &wg, resultsCh)
+	}
 
-    // Récupère tous les rapports depuis le channel
-    var rapports []RapportScan
-    for r := range resultsCh {
-        rapports = append(rapports, r)
-    }
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
 
-    fmt.Println("Scan terminé !")
+	var reports []ScanReport
+	for r := range resultsCh {
+		reports = append(reports, r)
+	}
 
-    // On renvoie la liste complète des rapports en JSON
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(rapports)
+	log.Println("multi-target scan complete")
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(reports); err != nil {
+		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+	}
+}
+
+// fuzzHandler sends multiple payloads to a target via POST and returns results.
+// Query parameters:
+// - url (required): target to POST to
+// - payloads (optional, multi): payload strings to send. If omitted, a small default set is used.
+func fuzzHandler(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	target := query.Get("url")
+	if target == "" {
+		http.Error(w, "url parameter missing", http.StatusBadRequest)
+		return
+	}
+
+	payloads := query["payloads"]
+	if len(payloads) == 0 {
+		payloads = []string{"admin' --", "<script>alert(1)</script>", "../../etc/passwd", "\" OR 1=1 --"}
+	}
+
+	// Concurrency limiter to avoid overwhelming the target or local resources
+	const maxConcurrency = 10
+	limiter := make(chan struct{}, maxConcurrency)
+
+	var wg sync.WaitGroup
+	resultsCh := make(chan FuzzReport, len(payloads))
+
+	for _, p := range payloads {
+		wg.Add(1)
+		limiter <- struct{}{} // acquire
+		go func(payload string) {
+			defer wg.Done()
+			defer func() { <-limiter }() // release
+
+			resp, err := httpClient.Post(target, "text/plain", strings.NewReader(payload))
+			if err != nil {
+				resultsCh <- FuzzReport{Payload: payload, Status: 0, BodyLength: 0, Error: err.Error()}
+				return
+			}
+			defer resp.Body.Close()
+
+			body, _ := io.ReadAll(resp.Body)
+			resultsCh <- FuzzReport{Payload: payload, Status: resp.StatusCode, BodyLength: len(body)}
+		}(p)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
+
+	var reports []FuzzReport
+	for r := range resultsCh {
+		reports = append(reports, r)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(reports); err != nil {
+		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+	}
 }
 
 func main() {
-    // On associe la route "/api/scan" à notre fonction handlerScan
-    http.HandleFunc("/api/scan", handlerScan)
+	http.HandleFunc("/api/scan", scanHandler)
+	http.HandleFunc("/api/fuzzing", fuzzHandler)
 
-    fmt.Println("Serveur démarré sur le port 8080...")
-
-    // C'est ici que tu interviens ! 👇
-    http.ListenAndServe(":80", nil)
+	fmt.Println("Server listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
